@@ -1,0 +1,20 @@
+[33m47a0818[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m Remove env.example
+[33mc5bc7b4[m test
+[33mef1a97d[m laravel update
+[33me6662b1[m laravel update
+[33m4518fb4[m[33m ([m[1;31morigin/main[m[33m)[m laravel update
+[33mb259749[m laravel update
+[33m7be2c33[m Auto migrate on start
+[33m9f3e603[m Auto migrate on start
+[33m061217c[m Auto migrate on start
+[33mc0dd86b[m Auto migrate on start
+[33md9b93a0[m Auto migrate on start
+[33ma32fd6d[m Auto migrate on start
+[33m7242245[m Fix Apache DocumentRoot to public
+[33m84b0a6f[m larvel hosting
+[33md5f0c72[m Fix role permission logic for laravel
+[33m53f6e97[m cofige more core
+[33mda1ba11[m push laravel new
+[33m92f5305[m Add project files and .gitignore
+[33m53fc167[m Initial Laravel project with Dockerfile
+[33m5948488[m Testing Laravel 12 ims

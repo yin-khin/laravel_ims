@@ -1,0 +1,674 @@
+<?php
+
+use App\Http\Controllers\AuthController;
+use App\Http\Controllers\BrandController;
+use App\Http\Controllers\CategoryController;
+use App\Http\Controllers\CustomerController;
+use App\Http\Controllers\ImportController;
+use App\Http\Controllers\NotificationController;
+use App\Http\Controllers\OrderController;
+use App\Http\Controllers\PaymentController;
+// Removed KhqrPaymentController import
+use App\Http\Controllers\AccountingIntegrationController;
+use App\Http\Controllers\EcommerceIntegrationController;
+use App\Http\Controllers\NotificationServiceController;
+use App\Http\Controllers\PaymentGatewayController;
+use App\Http\Controllers\ProductController;
+use App\Http\Controllers\ReportController;
+use App\Http\Controllers\ScheduledReportController;
+use App\Http\Controllers\StaffController;
+use App\Http\Controllers\SupplierController;
+use App\Http\Controllers\SystemStatusController;
+use App\Http\Controllers\ThirdPartyIntegrationController;
+use App\Http\Controllers\UserController;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\Storage;
+
+// Simple test route
+Route::get('/test-api', function () {
+    return response()->json(['message' => 'API routes are working']);
+});
+
+// Test route for debugging
+Route::get('/test-products', function () {
+    return response()->json([
+        'success' => true,
+        'message' => 'Test products endpoint working',
+       
+    ]);
+});
+
+// Test route for categories (public, no auth required)
+Route::get('/test-categories', [CategoryController::class, 'index']);
+
+// Fast reports endpoints (optimized for speed with real data)
+Route::get('/fast-import-report', function (Request $request) {
+    try {
+        // Log all request parameters
+        \Log::info('Fast Import Report Request:', [
+            'all_params' => $request->all(),
+            'date_from' => $request->date_from,
+            'date_to' => $request->date_to
+        ]);
+        
+        // Build query with date filtering
+        $query = "SELECT * FROM imports WHERE 1=1";
+        $params = [];
+        
+        if ($request->has('date_from') && !empty($request->date_from)) {
+            $query .= " AND DATE(imp_date) >= ?";
+            $params[] = $request->date_from;
+        }
+        
+        if ($request->has('date_to') && !empty($request->date_to)) {
+            $query .= " AND DATE(imp_date) <= ?";
+            $params[] = $request->date_to;
+        }
+        
+        $query .= " ORDER BY imp_date DESC";
+        
+        // Always allow up to 500 records
+        $query .= " LIMIT 500";
+        
+        \Log::info('Fast Import Report Query:', ['query' => $query, 'params' => $params]);
+        
+        // First, let's check if there are ANY imports in the database
+        $totalImports = \Illuminate\Support\Facades\DB::select("SELECT COUNT(*) as count FROM imports");
+        \Log::info('Total imports in database:', ['count' => $totalImports[0]->count ?? 0]);
+        
+        // Get sample dates to see what dates exist
+        $sampleDates = \Illuminate\Support\Facades\DB::select("SELECT id, imp_date FROM imports ORDER BY imp_date DESC LIMIT 5");
+        \Log::info('Sample import dates:', ['dates' => $sampleDates]);
+        
+        $imports = \Illuminate\Support\Facades\DB::select($query, $params);
+        
+        \Log::info('Fast Import Report Results:', [
+            'count' => count($imports),
+            'sample' => $imports[0] ?? null,
+            'first_import_date' => $imports[0]->imp_date ?? null
+        ]);
+
+        $result = [];
+        foreach ($imports as $import) {
+            // Get staff name from users table or use existing staff name
+            $staff = null;
+            if ($import->staff_id) {
+                // Try to get from users table first (users table has 'name' column, not 'full_name')
+                $staff = \Illuminate\Support\Facades\DB::select("
+                    SELECT name FROM users WHERE id = ?
+                ", [$import->staff_id]);
+                
+                // If not found in users, try staffs table (staffs table has 'full_name' column)
+                if (empty($staff) || !isset($staff[0]->name)) {
+                    $staff = \Illuminate\Support\Facades\DB::select("
+                        SELECT full_name as name FROM staffs WHERE id = ?
+                    ", [$import->staff_id]);
+                }
+            }
+            
+            // Get supplier name from suppliers table  
+            $supplier = null;
+            if ($import->sup_id) {
+                $supplier = \Illuminate\Support\Facades\DB::select("
+                    SELECT supplier FROM suppliers WHERE id = ?
+                ", [$import->sup_id]);
+            }
+
+            // Get real import_details from database
+            $details = \Illuminate\Support\Facades\DB::select("
+                SELECT 
+                    pro_code,
+                    pro_name,
+                    qty,
+                    price,
+                    amount,
+                    batch_number,
+                    expiration_date
+                FROM import_details
+                WHERE imp_code = ?
+                ORDER BY pro_name
+            ", [$import->id]);
+
+            $processedDetails = [];
+            foreach ($details as $detail) {
+                $processedDetails[] = [
+                    'pro_name' => $detail->pro_name ?? 'Unknown Product',
+                    'qty' => intval($detail->qty ?? 0),
+                    'amount' => floatval($detail->amount ?? 0),
+                    'price' => floatval($detail->price ?? 0),
+                    'batch_number' => $detail->batch_number ?? 'N/A',
+                    'expiration_date' => $detail->expiration_date ?? 'N/A'
+                ];
+            }
+
+            // If no details, create a general entry
+            if (empty($processedDetails)) {
+                $processedDetails[] = [
+                    'pro_name' => 'General Import',
+                    'qty' => 1,
+                    'amount' => floatval($import->total ?? 0),
+                    'price' => floatval($import->total ?? 0),
+                    'batch_number' => 'N/A',
+                    'expiration_date' => 'N/A'
+                ];
+            }
+
+            // Get staff name with fallback
+            $staffName = 'Unknown Staff';
+            if ($staff && !empty($staff) && isset($staff[0]) && isset($staff[0]->name)) {
+                $staffName = $staff[0]->name;
+            } elseif (isset($import->full_name) && $import->full_name && $import->full_name !== 'Import from') {
+                $staffName = $import->full_name;
+            }
+            
+            // Ensure we don't use "Import from" as staff name or empty values
+            if ($staffName === 'Import from' || empty($staffName) || trim($staffName) === '') {
+                $staffName = 'Unknown Staff';
+            }
+            
+            $result[] = [
+                'id' => $import->id,
+                'imp_date' => $import->imp_date,
+                'staff_name' => $staffName,
+                'supplier_name' => $supplier ? ($supplier[0]->supplier ?? 'Unknown Supplier') : ($import->supplier ?? 'Unknown Supplier'),
+                'total_amount' => floatval($import->total ?? 0),
+                'status' => $import->status ?? 'completed',
+                'import_details' => $processedDetails
+            ];
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => $result
+        ]);
+    } catch (\Exception $e) {
+        \Log::error('Fast Import Report Error:', [
+            'message' => $e->getMessage(),
+            'file' => $e->getFile(),
+            'line' => $e->getLine(),
+            'trace' => $e->getTraceAsString()
+        ]);
+        
+        return response()->json([
+            'success' => false,
+            'message' => 'Error: ' . $e->getMessage(),
+            'data' => [],
+            'error_details' => [
+                'file' => basename($e->getFile()),
+                'line' => $e->getLine()
+            ]
+        ]);
+    }
+});
+
+Route::get('/fast-sales-report', function (Request $request) {
+    try {
+        // Build query with date filtering
+        $query = "SELECT * FROM orders WHERE 1=1";
+        $params = [];
+        
+        if ($request->has('date_from')) {
+            $query .= " AND DATE(ord_date) >= ?";
+            $params[] = $request->date_from;
+        }
+        
+        if ($request->has('date_to')) {
+            $query .= " AND DATE(ord_date) <= ?";
+            $params[] = $request->date_to;
+        }
+        
+        $query .= " ORDER BY ord_date DESC";
+        
+        // Only apply LIMIT if no date range is specified
+        if (!$request->has('date_from') && !$request->has('date_to')) {
+            $query .= " LIMIT 100";
+        }
+        
+        $orders = \Illuminate\Support\Facades\DB::select($query, $params);
+
+        $result = [];
+        foreach ($orders as $order) {
+            // Get staff name from staffs table (orders.staff_id references staffs.id)
+            $staff = null;
+            if ($order->staff_id) {
+                // Orders table has foreign key to staffs table, not users table
+                // Try to get from staffs table first (staffs table has 'full_name' column)
+                $staff = \Illuminate\Support\Facades\DB::select("
+                    SELECT full_name as name FROM staffs WHERE id = ?
+                ", [$order->staff_id]);
+                
+                // If not found in staffs, try users table as fallback (users table has 'name' column)
+                if (empty($staff) || !isset($staff[0]->name)) {
+                    $staff = \Illuminate\Support\Facades\DB::select("
+                        SELECT name FROM users WHERE id = ?
+                    ", [$order->staff_id]);
+                }
+            }
+
+            // Get customer name
+            $customer = null;
+            if ($order->cus_id) {
+                $customer = \Illuminate\Support\Facades\DB::select("
+                    SELECT cus_name FROM customers WHERE id = ?
+                ", [$order->cus_id]);
+            }
+
+            // Get real order_details from database
+            $details = \Illuminate\Support\Facades\DB::select("
+                SELECT 
+                    pro_code,
+                    pro_name,
+                    qty,
+                    price,
+                    amount
+                FROM order_details
+                WHERE ord_code = ?
+                ORDER BY pro_name
+            ", [$order->id]);
+
+            $processedDetails = [];
+            foreach ($details as $detail) {
+                $processedDetails[] = [
+                    'pro_name' => $detail->pro_name ?? 'Unknown Product',
+                    'qty' => intval($detail->qty ?? 0),
+                    'amount' => floatval($detail->amount ?? 0),
+                    'price' => floatval($detail->price ?? 0)
+                ];
+            }
+
+            // If no details, create a general entry
+            if (empty($processedDetails)) {
+                $processedDetails[] = [
+                    'pro_name' => 'General Order',
+                    'qty' => 1,
+                    'amount' => floatval($order->total ?? 0),
+                    'price' => floatval($order->total ?? 0)
+                ];
+            }
+
+            // Calculate payment status
+            $payments = \Illuminate\Support\Facades\DB::select("
+                SELECT SUM(deposit) as total_paid FROM payments WHERE ord_code = ?
+            ", [$order->id]);
+            
+            $totalPaid = floatval($payments[0]->total_paid ?? 0);
+            $totalAmount = floatval($order->total ?? 0);
+            
+            $paymentStatus = 'unpaid';
+            if ($totalPaid >= $totalAmount) {
+                $paymentStatus = 'paid';
+            } elseif ($totalPaid > 0) {
+                $paymentStatus = 'partial';
+            }
+
+            // Get staff name with proper fallback
+            // Orders table stores staff full_name directly in full_name column
+            $staffName = 'Unknown Staff';
+            if ($staff && !empty($staff) && isset($staff[0]) && isset($staff[0]->name)) {
+                $staffName = $staff[0]->name;
+            } elseif (isset($order->full_name) && $order->full_name && $order->full_name !== 'Import from' && trim($order->full_name) !== '') {
+                // Use full_name from orders table (this is the staff name stored when order was created)
+                $staffName = $order->full_name;
+            } elseif (isset($order->staff_name) && $order->staff_name && $order->staff_name !== 'Import from') {
+                $staffName = $order->staff_name;
+            }
+            
+            // Ensure we don't use invalid staff names
+            if ($staffName === 'Import from' || empty($staffName) || trim($staffName) === '') {
+                $staffName = 'Unknown Staff';
+            }
+            
+            $result[] = [
+                'id' => $order->id,
+                'ord_date' => $order->ord_date,
+                'cus_name' => $customer ? ($customer[0]->cus_name ?? 'Unknown Customer') : ($order->cus_name ?? 'Unknown Customer'),
+                'staff_name' => $staffName,
+                'total' => $totalAmount,
+                'payment_status' => $paymentStatus,
+                'status' => $order->status ?? 'completed',
+                'order_details' => $processedDetails
+            ];
+        }
+
+        \Log::info('Fast Sales Report Results:', [
+            'count' => count($result),
+            'sample' => $result[0] ?? null
+        ]);
+        
+        return response()->json([
+            'success' => true,
+            'data' => $result
+        ]);
+    } catch (\Exception $e) {
+        \Log::error('Fast Sales Report Error:', [
+            'message' => $e->getMessage(),
+            'file' => $e->getFile(),
+            'line' => $e->getLine(),
+            'trace' => $e->getTraceAsString()
+        ]);
+        
+        return response()->json([
+            'success' => false,
+            'message' => 'Error: ' . $e->getMessage(),
+            'data' => [],
+            'error_details' => [
+                'file' => basename($e->getFile()),
+                'line' => $e->getLine()
+            ]
+        ]);
+    }
+});
+
+/*
+ * |--------------------------------------------------------------------------
+ * | API Routes
+ * |--------------------------------------------------------------------------
+ * |
+ * | Here is where you can register API routes for your application. These
+ * | routes are loaded by the RouteServiceProvider and all of them will
+ * | be assigned to the "api" middleware group. Make something great!
+ * |
+ */
+
+// All API routes are prefixed with /api by default in Laravel
+
+// Test route to verify storage access
+Route::get('/test-storage/{folder}/{filename}', function ($folder, $filename) {
+    $path = "{$folder}/{$filename}";
+    $exists = Storage::disk('public')->exists($path);
+    $filePath = storage_path("app/public/{$path}");
+    
+    return response()->json([
+        'folder' => $folder,
+        'filename' => $filename,
+        'path' => $path,
+        'exists' => $exists,
+        'file_path' => $filePath,
+        'file_exists' => file_exists($filePath),
+        'is_readable' => is_readable($filePath),
+        'storage_path' => storage_path('app/public'),
+        'files_in_folder' => $exists ? Storage::disk('public')->files($folder) : []
+    ]);
+});
+
+// Public image serving route (no authentication required)
+Route::get('/storage/{folder}/{filename}', function ($folder, $filename) {
+    try {
+        // Decode URL-encoded filename
+        $filename = urldecode($filename);
+        $folder = urldecode($folder);
+        
+        // Use Storage facade to properly access files
+        $path = "{$folder}/{$filename}";
+        $filePath = storage_path("app/public/{$path}");
+        
+        // Check if file exists using Storage facade
+        if (!Storage::disk('public')->exists($path)) {
+            // Also check directly with file_exists as fallback
+            if (!file_exists($filePath)) {
+                \Log::warning("Image not found: {$path}", [
+                    'folder' => $folder,
+                    'filename' => $filename,
+                    'full_path' => $filePath,
+                    'storage_root' => storage_path('app/public'),
+                    'files_in_folder' => Storage::disk('public')->files($folder)
+                ]);
+                return response()->json([
+                    'error' => 'Image not found',
+                    'path' => $path,
+                    'file_path' => $filePath
+                ], 404);
+            }
+        }
+        
+        // Read file
+        $file = file_get_contents($filePath);
+        
+        if ($file === false) {
+            \Log::error("Failed to read file: {$filePath}");
+            return response()->json(['error' => 'Failed to read file', 'path' => $filePath], 500);
+        }
+        
+        // Get MIME type
+        $type = null;
+        if (function_exists('finfo_open')) {
+            $finfo = finfo_open(FILEINFO_MIME_TYPE);
+            $type = finfo_file($finfo, $filePath);
+            finfo_close($finfo);
+        }
+        
+        // Fallback to extension-based MIME type
+        if (!$type) {
+            $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+            $mimeTypes = [
+                'jpg' => 'image/jpeg',
+                'jpeg' => 'image/jpeg',
+                'png' => 'image/png',
+                'gif' => 'image/gif',
+                'webp' => 'image/webp',
+                'svg' => 'image/svg+xml',
+            ];
+            $type = $mimeTypes[$extension] ?? 'application/octet-stream';
+        }
+        
+        return response($file, 200)
+            ->header('Content-Type', $type)
+            ->header('Cache-Control', 'public, max-age=31536000')
+            ->header('Access-Control-Allow-Origin', '*')
+            ->header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    } catch (\Exception $e) {
+        \Log::error("Error serving image: " . $e->getMessage(), [
+            'trace' => $e->getTraceAsString(),
+            'folder' => $folder ?? 'unknown',
+            'filename' => $filename ?? 'unknown'
+        ]);
+        return response()->json([
+            'error' => 'Internal server error',
+            'message' => $e->getMessage(),
+            'file' => $e->getFile(),
+            'line' => $e->getLine()
+        ], 500);
+    }
+})->where(['folder' => '[a-zA-Z0-9_-]+', 'filename' => '.+']); // Allow any characters in filename
+
+// System status routes (no authentication required for health checks)
+Route::prefix('system')->group(function () {
+    Route::get('health', [SystemStatusController::class, 'healthCheck']);
+    Route::get('metrics', [SystemStatusController::class, 'metrics']);
+});
+
+// Authentication routes
+Route::prefix('auth')->group(function () {
+    Route::post('login', [AuthController::class, 'login']);
+    Route::post('register', [AuthController::class, 'register']);
+    Route::post('forgot-password', [AuthController::class, 'requestPasswordReset']);
+    Route::post('reset-password', [AuthController::class, 'resetPassword']);
+    // auth:sanctum
+    Route::middleware('auth:api')->group(function () {
+        Route::get('profile', [AuthController::class, 'profile']);
+        Route::put('profile/{id}', [AuthController::class, 'update']);
+        Route::post('logout', [AuthController::class, 'logout']);
+        Route::post('change-password', [AuthController::class, 'changePassword']);
+    });
+});
+
+// Protected routes
+Route::middleware('auth:api')->group(function () {
+    // Read-only routes for all users
+    Route::get('users', [UserController::class, 'index']);
+    Route::get('users/{id}', [UserController::class, 'show']);
+    Route::get('suppliers', [SupplierController::class, 'index']);
+    Route::get('suppliers/{id}', [SupplierController::class, 'show']);
+    Route::get('staffs', [StaffController::class, 'index']);
+    Route::get('staffs/{id}', [StaffController::class, 'show']);
+    Route::get('customers', [CustomerController::class, 'index']);
+    Route::get('customers/{id}', [CustomerController::class, 'show']);
+    Route::get('categories', [CategoryController::class, 'index']);
+    Route::get('categories/{id}', [CategoryController::class, 'show']);
+    Route::get('brands', [BrandController::class, 'index']);
+    Route::get('brands/{id}', [BrandController::class, 'show']);
+    Route::get('products', [ProductController::class, 'index']);
+    Route::get('products/get-low-stock-products', [ProductController::class, 'getLowStockProducts']);
+    Route::get('products/{id}', [ProductController::class, 'show']);
+    Route::get('imports', [ImportController::class, 'index']);
+    Route::get('imports/{id}', [ImportController::class, 'show']);
+    Route::get('imports/{id}/details', [ImportController::class, 'getDetails']);
+    Route::get('orders', [OrderController::class, 'index']);
+    Route::get('orders/{id}', [OrderController::class, 'show']);
+    Route::get('payments', [PaymentController::class, 'index']);
+    Route::get('payments/{id}', [PaymentController::class, 'show']);
+    
+    // Profile image upload
+    Route::post('auth/profile/{id}/upload-image', [AuthController::class, 'uploadImage']);
+
+    // Admin-only routes for CUD operations
+    Route::middleware('admin')->group(function () {
+        Route::post('users', [UserController::class, 'store']);
+        Route::put('users/{id}', [UserController::class, 'update']);
+        Route::delete('users/{id}', [UserController::class, 'destroy']);
+
+        Route::post('suppliers', [SupplierController::class, 'store']);
+        Route::put('suppliers/{id}', [SupplierController::class, 'update']);
+        Route::delete('suppliers/{id}', [SupplierController::class, 'destroy']);
+
+        Route::post('staffs', [StaffController::class, 'store']);
+        Route::put('staffs/{id}', [StaffController::class, 'update']);
+        Route::delete('staffs/{id}', [StaffController::class, 'destroy']);
+
+        Route::post('customers', [CustomerController::class, 'store']);
+        Route::put('customers/{id}', [CustomerController::class, 'update']);
+        Route::delete('customers/{id}', [CustomerController::class, 'destroy']);
+
+        Route::post('categories', [CategoryController::class, 'store']);
+        Route::put('categories/{id}', [CategoryController::class, 'update']);
+        Route::delete('categories/{id}', [CategoryController::class, 'destroy']);
+
+        Route::post('brands', [BrandController::class, 'store']);
+        Route::put('brands/{id}', [BrandController::class, 'update']);
+        Route::delete('brands/{id}', [BrandController::class, 'destroy']);
+
+        // Admin-only routes for safety
+        Route::delete('products/{id}', [ProductController::class, 'destroy']);
+        Route::delete('imports/{id}', [ImportController::class, 'destroy']);
+
+        Route::delete('orders/{id}', [OrderController::class, 'destroy']);
+        Route::delete('orders/{id}/force', [OrderController::class, 'forceDestroy']);
+
+        Route::post('payments', [PaymentController::class, 'store']);
+        Route::put('payments/{id}', [PaymentController::class, 'update']);
+        Route::delete('payments/{id}', [PaymentController::class, 'destroy']);
+    });
+
+    // Sales Staff routes for creating orders and payments
+    Route::middleware('sales')->group(function () {
+        Route::post('orders', [OrderController::class, 'store']);
+        Route::put('orders/{id}', [OrderController::class, 'update']);
+
+        Route::post('payments', [PaymentController::class, 'store']);
+        Route::put('payments/{id}', [PaymentController::class, 'update']);
+        Route::delete('payments/{id}', [PaymentController::class, 'destroy']);
+    });
+
+    // Third-party integration routes
+    Route::prefix('integrations')->group(function () {
+        Route::get('inventory-levels', [ThirdPartyIntegrationController::class, 'getInventoryLevels']);
+        Route::get('product-movement-history', [ThirdPartyIntegrationController::class, 'getProductMovementHistory']);
+        Route::get('supplier-performance', [ThirdPartyIntegrationController::class, 'getSupplierPerformance']);
+        Route::get('customer-purchase-history', [ThirdPartyIntegrationController::class, 'getCustomerPurchaseHistory']);
+        Route::get('real-time-sales', [ThirdPartyIntegrationController::class, 'getRealTimeSalesData']);
+        Route::get('product-recommendations', [ThirdPartyIntegrationController::class, 'getProductRecommendations']);
+
+        // Webhook endpoint for external systems
+        Route::post('webhook', [ThirdPartyIntegrationController::class, 'webhookReceiver']);
+
+        // Payment gateway integrations
+        Route::prefix('payments')->group(function () {
+            Route::post('paypal/process', [PaymentGatewayController::class, 'processPayPalPayment']);
+            Route::post('paypal/capture', [PaymentGatewayController::class, 'capturePayPalPayment']);
+            Route::post('stripe/process', [PaymentGatewayController::class, 'processStripePayment']);
+            Route::post('stripe/intent', [PaymentGatewayController::class, 'createStripePaymentIntent']);
+        });
+
+        // Accounting integrations
+        Route::prefix('accounting')->group(function () {
+            Route::post('quickbooks/invoice', [AccountingIntegrationController::class, 'createQuickBooksInvoice']);
+            Route::post('quickbooks/customer', [AccountingIntegrationController::class, 'createQuickBooksCustomer']);
+            Route::post('xero/invoice', [AccountingIntegrationController::class, 'createXeroInvoice']);
+            Route::post('xero/contact', [AccountingIntegrationController::class, 'createXeroContact']);
+        });
+
+        // E-commerce integrations
+        Route::prefix('ecommerce')->group(function () {
+            Route::post('shopify/sync-product', [EcommerceIntegrationController::class, 'syncProductToShopify']);
+            Route::put('shopify/inventory/{product_id}', [EcommerceIntegrationController::class, 'updateShopifyInventory']);
+            Route::post('woocommerce/sync-product', [EcommerceIntegrationController::class, 'syncProductToWooCommerce']);
+            Route::put('woocommerce/inventory/{product_id}', [EcommerceIntegrationController::class, 'updateWooCommerceInventory']);
+        });
+
+        // Notification service integrations
+        Route::prefix('notifications')->group(function () {
+            Route::post('sms/send', [NotificationServiceController::class, 'sendSms']);
+            Route::post('email/send', [NotificationServiceController::class, 'sendEmail']);
+            Route::post('alerts/low-stock', [NotificationServiceController::class, 'sendLowStockAlert']);
+            Route::post('alerts/order-confirmation', [NotificationServiceController::class, 'sendOrderConfirmation']);
+        });
+    });
+
+    // Report routes
+    Route::prefix('reports')->middleware('auth:sanctum')->group(function () {
+        Route::get('import-report', [ReportController::class, 'getImportReport']);
+        Route::get('sales-report', [ReportController::class, 'getSalesReport']);
+        Route::get('import-summary', [ReportController::class, 'getImportSummary']);
+        Route::get('sales-summary', [ReportController::class, 'getSalesSummary']);
+        Route::get('export-import-excel', [ReportController::class, 'exportImportExcel']);
+        Route::get('export-sales-excel', [ReportController::class, 'exportSalesExcel']);
+        Route::get('export-import-excel-xlsx', [ReportController::class, 'exportImportExcelXlsx']);
+        Route::get('export-sales-excel-xlsx', [ReportController::class, 'exportSalesExcelXlsx']);
+        Route::get('export-import-pdf', [ReportController::class, 'exportImportPdf']);
+        Route::get('export-sales-pdf', [ReportController::class, 'exportSalesPdf']);
+        Route::get('export-single-import-word', [ReportController::class, 'exportSingleImportWord']);
+        Route::get('export-single-sales-word', [ReportController::class, 'exportSingleSalesWord']);
+
+        // Scheduled reports
+        Route::get('best-selling-products', [ScheduledReportController::class, 'bestSellingProducts']);
+        Route::get('low-stock-products', [ScheduledReportController::class, 'lowStockProducts']);
+        Route::get('inventory-summary', [ScheduledReportController::class, 'inventorySummary']);
+    });
+
+    // Additional payment routes
+    Route::get('payments/pending', [PaymentController::class, 'getPendingPayments']);
+    Route::get('payments/summary', [PaymentController::class, 'getPaymentSummary']);
+    Route::get('payments/order/{orderId}/status', [PaymentController::class, 'getOrderPaymentStatus']);
+    Route::post('payments/cleanup', [PaymentController::class, 'cleanupPaymentData']);
+
+    // Notification routes
+    Route::prefix('notifications')->group(function () {
+        Route::get('/', [NotificationController::class, 'index']);
+        Route::post('/', [NotificationController::class, 'store']);
+        Route::get('/unread-count', [NotificationController::class, 'unreadCount']);
+        Route::get('/{id}', [NotificationController::class, 'show']);
+        Route::put('/{id}', [NotificationController::class, 'update']);
+        Route::delete('/{id}', [NotificationController::class, 'destroy']);
+        Route::post('/{id}/mark-as-read', [NotificationController::class, 'markAsRead']);
+        Route::post('/mark-all-as-read', [NotificationController::class, 'markAllAsRead']);
+    });
+
+    // Additional product routes (must be before products/{id} route)
+    Route::get('products/low-stock', [ProductController::class, 'getLowStockProducts']);
+    Route::get('products/expired', [ProductController::class, 'getExpiredProducts']);
+    Route::get('products/near-expiration', [ProductController::class, 'getNearExpirationProducts']);
+    
+    // Product and Import management routes (admin OR inventory staff)
+    Route::middleware(['admin_or_inventory'])->group(function () {
+        // Product management
+        Route::post('products', [ProductController::class, 'store']);
+        Route::put('products/{id}', [ProductController::class, 'update']);
+        Route::post('products/{id}/deactivate', [ProductController::class, 'deactivate']);
+        Route::post('products/{id}/activate', [ProductController::class, 'activate']);
+        
+        // Import management
+        Route::post('imports', [ImportController::class, 'store']);
+        Route::put('imports/{id}', [ImportController::class, 'update']);
+    });
+});
